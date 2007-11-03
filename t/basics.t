@@ -2,30 +2,69 @@
 use strict;
 use warnings;
 
-use Test::More tests => 4;
+use Test::More tests => 11;
 use Test::Deep;
 
 use_ok 'Parse::BooleanLogic';
 
+
 my $parser = new Parse::BooleanLogic;
-cmp_deeply
-    $parser->as_array('x = 10'),
-    [{left => 'x', operator => '=', right => 10}],
-    'x = 10'
+
+sub parse_cmp($$) {
+    my ($string, $struct) = @_;
+    cmp_deeply $parser->as_array($string), $struct, $string;
+}
+
+parse_cmp
+    '',
+    [],
 ;
 
-cmp_deeply
-    $parser->as_array('(x = 10)'),
-    [[{left => 'x', operator => '=', right => 10}]],
-    'x = 10'
+parse_cmp
+    'x = 10',
+    [{ operand => 'x = 10' }],
 ;
 
-cmp_deeply
-    $parser->as_array('(x = 10) OR y = "Y"'),
+parse_cmp
+    '(x = 10)',
+    [[{ operand => 'x = 10' }]],
+;
+
+parse_cmp
+    '(x = 10) OR y = "Y"',
     [
-        [{ left => 'x', operator => '=', right => 10 }],
+        [{ operand => 'x = 10' }],
         'OR',
-        { left => 'y', operator => '=', right => 'Y' }
+        { operand => 'y = "Y"' }
     ],
-    'x = 10'
+;
+
+parse_cmp
+    'just a string',
+    [{ operand => 'just a string' }],
+;
+
+parse_cmp
+    '"quoted string"',
+    [{ operand => '"quoted string"' }],
+;
+
+parse_cmp
+    '"quoted string (with parens)"',
+    [{ operand => '"quoted string (with parens)"' }],
+;
+
+parse_cmp
+    'string "quoted" in the middle',
+    [{ operand => 'string "quoted" in the middle' }],
+;
+
+parse_cmp
+    'string OR string',
+    [{ operand => 'string' }, 'OR', { operand => 'string' }],
+;
+
+parse_cmp
+    '"OR" OR string',
+    [{ operand => '"OR"' }, 'OR', { operand => 'string' }],
 ;
