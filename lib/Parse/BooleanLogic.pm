@@ -35,22 +35,23 @@ use warnings;
 
 package Parse::BooleanLogic;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use constant OPERAND     => 1;
 use constant OPERATOR    => 2;
 use constant OPEN_PAREN  => 4;
 use constant CLOSE_PAREN => 8;
-my @tokens = qw[OPERAND OPERATOR OPEN_PAREN CLOSE_PAREN];
+use constant STOP        => 16;
+my @tokens = qw[OPERAND OPERATOR OPEN_PAREN CLOSE_PAREN STOP];
 
 use Regexp::Common qw(delimited);
-my $re_operator    = qr[(?i:AND|OR)];
-my $re_open_paren  = qr[\(];
-my $re_close_paren = qr[\)];
+my $re_operator    = qr{\b(?i:AND|OR)\b};
+my $re_open_paren  = qr{\(};
+my $re_close_paren = qr{\)};
 
 my $re_tokens      = qr{(?:$re_operator|$re_open_paren|$re_close_paren)};
 my $re_delim       = qr{$RE{delimited}{-delim=>qq{\'\"}}};
-my $re_operand     = qr{(?!\s)(?:$re_delim|(?!$re_tokens|["']).+?(?=$re_tokens|["']|\Z))+};
+my $re_operand     = qr{(?:$re_delim|(?!$re_tokens|["']).+?(?=$re_tokens|["']|\Z))+};
 
 =head1 METHODS
 
@@ -186,66 +187,52 @@ sub parse {
     my ($string, $cb) = @args{qw(string callback)};
     $string = '' unless defined $string;
 
-    my $want = OPERAND | OPEN_PAREN;
+    # States
+    my $want = OPERAND | OPEN_PAREN | STOP;
     my $last = 0;
-
     my $depth = 0;
 
-    while ( $string =~ /(
-                        $re_operator
-                        |$re_open_paren
-                        |$re_close_paren
-                        |$re_operand
-                       )/iogx )
-    {
-        my $match = $1;
-        next if $match =~ /^\s*$/;
-
-        # Highest priority is last
-        my $current = 0;
-        $current = OPERAND     if ($want & OPERAND)     && $match =~ /^$re_operand$/io;
-        $current = OPERATOR    if ($want & OPERATOR)    && $match =~ /^$re_operator$/io;
-        $current = OPEN_PAREN  if ($want & OPEN_PAREN)  && $match =~ /^$re_open_paren$/io;
-        $current = CLOSE_PAREN if ($want & CLOSE_PAREN) && $match =~ /^$re_close_paren$/io;
-
-        unless ($current && $want & $current) {
-            my $tmp = substr($string, 0, pos($string)- length($match));
-            $tmp .= '>'. $match .'<--here'. substr($string, pos($string));
-            my $msg = "Wrong expression, expecting a ". $self->bitmask_to_string($want) ." in '$tmp'";
-            $cb->{'error'}? $cb->{'error'}->($msg): die $msg;
-            return;
+    while (1) {
+        # State Machine
+        if ( ($want & OPERAND    ) && $string =~ /\G\s*($re_operand)/iogc ) {
+            my $m = $1;
+            $m=~ s/\s+$//;
+            $cb->{'operand'}->( $m );
+            $last = OPERAND;
+            $want = OPERATOR;
+            $want |= $depth? CLOSE_PAREN : STOP;
         }
-
-        # State Machine:
-        if ( $current & OPEN_PAREN ) {
-            $cb->{'open_paren'}->( $match );
+        elsif ( ($want & OPERATOR   ) && $string =~ /\G\s*($re_operator)/iogc ) {
+            $cb->{'operator'}->( $1 );
+            $last = OPERATOR;
+            $want = OPERAND | OPEN_PAREN;
+        }
+        elsif ( ($want & OPEN_PAREN ) && $string =~ /\G\s*($re_open_paren)/iogc ) {
+            $cb->{'open_paren'}->( $1 );
             $depth++;
+            $last = OPEN_PAREN;
             $want = OPERAND | OPEN_PAREN;
         }
-        elsif ( $current & CLOSE_PAREN ) {
-            $cb->{'close_paren'}->( $match );
+        elsif ( ($want & CLOSE_PAREN) && $string =~ /\G\s*($re_close_paren)/iogc ) {
+            $cb->{'close_paren'}->( $1 );
             $depth--;
+            $last = CLOSE_PAREN;
             $want = OPERATOR;
-            $want |= CLOSE_PAREN if $depth;
+            $want |= $depth? CLOSE_PAREN : STOP;
         }
-        elsif ( $current & OPERATOR ) {
-            $cb->{'operator'}->( $match );
-            $want = OPERAND | OPEN_PAREN;
+        elsif ( ($want & STOP) && $string =~ /\G\s*$/igc ) {
+            $last = STOP;
+            last;
         }
-        elsif ( $current & OPERAND ) {
-            $match =~ s/\s+$//;
-            $cb->{'operand'}->( $match );
-            $want = OPERATOR;
-            $want |= CLOSE_PAREN if $depth;
+        else {
+            last;
         }
-
-        $last = $current;
     }
 
-    unless ( !$last || $last & (CLOSE_PAREN | OPERAND) ) {
-        my $msg = "Incomplete query, last element ("
-            . $self->bitmask_to_string($last)
-            . ") is not CLOSE_PAREN or OPERAND in '$string'";
+    if (!$last || !($want & $last)) {
+        my $tmp = substr( $string, 0, pos($string) );
+        $tmp .= '>>>here<<<'. substr($string, pos($string));
+        my $msg = "Incomplete or incorrect expression, expecting a ". $self->bitmask_to_string($want) ." in '$tmp'";
         $cb->{'error'}? $cb->{'error'}->($msg): die $msg;
         return;
     }
@@ -275,12 +262,25 @@ sub bitmask_to_string {
 =head2 Tree modifications
 
 Several functions taking a tree of boolean expressions as returned by
-as_array method and changing it using a callback.
+L<as_array> method and changing it using a callback.
 
 =head3 filter $tree $callback
 
-Returns sub-tree where only operands left for which the callback returned
-true value.
+Filters a tree using provided callback. The callback is called for each operand
+in the tree and operand is left when it returns true value.
+
+Boolean operators (AND/OR) are skipped according to parens and left first rule,
+for example:
+
+    X OR Y AND Z -> X AND Z
+    X OR (Y AND Z) -> X OR Z
+    X OR Y AND Z -> Y AND Z
+    X OR (Y AND Z) -> Y AND Z
+    X OR Y AND Z -> X OR Y
+    X OR (Y AND Z) -> X OR Y
+
+Returns new sub-tree. Original tree is not changed, but operands in new tree
+still refer to the same hashes in original.
 
 =cut
 
@@ -291,13 +291,13 @@ sub filter {
 
     my @res;
     foreach my $entry ( @$tree ) {
-        next if $skip_next-- > 0;
+        $skip_next-- and next if $skip_next > 0;
 
         if ( ref $entry eq 'ARRAY' ) {
             my $tmp = $self->filter( $entry, $cb, 1 );
             if ( !$tmp || (ref $tmp eq 'ARRAY' && !@$tmp) ) {
                 pop @res;
-                $skip_next = 1 unless @res;
+                $skip_next++ unless @res;
             } else {
                 push @res, $tmp;
             }
@@ -306,7 +306,7 @@ sub filter {
                 push @res, $entry;
             } else {
                 pop @res;
-                $skip_next = 1 unless @res;
+                $skip_next++ unless @res;
             }
         } else {
             push @res, $entry;
@@ -318,8 +318,25 @@ sub filter {
 
 =head3 solve $tree $callback
 
-Returns sub-tree where only operands left for which the callback returned
-true value.
+Solves a boolean expression using provided callback. Callback is called
+for operands and should return a boolean value.
+
+Functions matrixes:
+
+    A B AND OR
+    0 0 0   0
+    0 1 0   1
+    1 0 0   1
+    1 1 1   1
+
+Whole branches of the tree can be skipped when result is obvious, for example:
+
+    1 OR  (...)
+    0 AND (...)
+
+Returns result of the expression.
+
+See also L</fsolve>.
 
 =cut
 
@@ -328,7 +345,7 @@ sub solve {
 
     my ($res, $ea, $skip_next) = (0, 'OR', 0);
     foreach my $entry ( @$tree ) {
-        next if $skip_next-- > 0;
+        $skip_next-- and next if $skip_next > 0;
         unless ( ref $entry ) {
             $ea = $entry;
             $skip_next++ if ($res && $ea eq 'OR') || (!$res && $ea eq 'AND');
@@ -337,7 +354,7 @@ sub solve {
 
         my $cur;
         if ( ref $entry eq 'ARRAY' ) {
-            $cur = $self->solve( $entry, $cb, 1 );
+            $cur = $self->solve( $entry, $cb );
         } else {
             $cur = $cb->( $entry );
         }
@@ -347,7 +364,50 @@ sub solve {
             $res &&= $cur;
         }
     }
-    return $res? 1 : 0;
+    return $res;
+}
+
+=head3 fsolve $tree $callback
+
+Does in filter+solve in one go. Callback can return undef to filter out an operand,
+and a defined boolean value to be used in solve.
+
+Returns boolean result of the equation or undef if all operands have been filtered.
+
+See also L</filter> and L</solve>.
+
+=cut
+
+sub fsolve {
+    my ($self, $tree, $cb) = @_;
+
+    my ($res, $ea, $skip_next) = (undef, 'OR', 0);
+    foreach my $entry ( @$tree ) {
+        $skip_next-- and next if $skip_next > 0;
+        unless ( ref $entry ) {
+            $ea = $entry;
+            $skip_next++ if ($res && $ea eq 'OR') || (!$res && $ea eq 'AND');
+            next;
+        }
+
+        my $cur;
+        if ( ref $entry eq 'ARRAY' ) {
+            $cur = $self->fsolve( $entry, $cb );
+        } else {
+            $cur = $cb->( $entry );
+        }
+        if ( defined $cur ) {
+            $res ||= 0;
+            if ( $ea eq 'OR' ) {
+                $res ||= $cur;
+            } else {
+                $res &&= $cur;
+            }
+        } else {
+            $skip_next++ unless defined $res;
+        }
+    }
+    return $res;
 }
 
 1;
