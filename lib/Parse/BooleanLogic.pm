@@ -3,7 +3,7 @@
 Parse::BooleanLogic - parser of boolean expressions
 
 =head1 SYNOPSIS
-    
+
     my $parser = new Parse::BooleanLogic;
     my $tree = $parser->as_array( string => 'x = 10' );
     $tree = $parser->as_array( string => 'x = 10 OR (x > 20 AND x < 30)' );
@@ -21,21 +21,37 @@ Parse::BooleanLogic - parser of boolean expressions
 
 =head1 DESCRIPTION
 
-This module is quite fast parser for boolean expressions. Original it's been writen for
-Request Tracker for parsing SQL like expressions and it's still capable to, but
+This module is quite fast parser for boolean expressions. Originally it's been writen for
+Request Tracker to parse SQL like expressions and it's still capable, but
 it can be used to parse other boolean logic sentences with OPERANDs joined using
 binary OPERATORs and grouped and nested using parentheses (OPEN_PAREN and CLOSE_PAREN).
 
+Operand is not qualified strictly what makes parser flexible enough to parse different
+things, for example:
+
+    # SQL like expressions
+    (task.status = "new" OR task.status = "open") AND task.owner_id = 123
+
+    # Google like search syntax used in Gmail and other service
+    subject:"some text" (from:me OR to:me) label:todo !label:done
+
+    # Binary boolean logic expressions
+    (a | b) & (c | d)
+
+You can change literals used for boolean operators and parens. Read more
+about this in description of constructor's arguments.
+
+As you can see quoted strings are supported and based on delimited strings
+from L<Regexp::Common> with ' and " as delimiters.
+
 =cut
-
-
 
 use strict;
 use warnings;
 
 package Parse::BooleanLogic;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 use constant OPERAND     => 1;
 use constant OPERATOR    => 2;
@@ -45,27 +61,111 @@ use constant STOP        => 16;
 my @tokens = qw[OPERAND OPERATOR OPEN_PAREN CLOSE_PAREN STOP];
 
 use Regexp::Common qw(delimited);
-my $re_operator    = qr{\b(?i:AND|OR)\b};
-my $re_open_paren  = qr{\(};
-my $re_close_paren = qr{\)};
-
-my $re_tokens      = qr{(?:$re_operator|$re_open_paren|$re_close_paren)};
-my $re_delim       = qr{$RE{delimited}{-delim=>qq{\'\"}}};
-my $re_operand     = qr{(?:$re_delim|(?!$re_tokens|["']).+?(?=$re_tokens|["']|\Z))+};
+my $re_delim = qr{$RE{delimited}{-delim=>qq{\'\"}}};
 
 =head1 METHODS
 
-=head2 new
+=head2 Building parser
 
-Very simple constructor, returns a new object. Now takes no options and most
-methods can be executed as class methods too, however there are plans to
-change it and using this lightweight constructor is recommended.
+=head3 new
+
+A constuctor, takes the following named arguments:
+
+=over 4
+
+=item operators, default is ['AND' 'OR']
+
+Pair of literal strings representing boolean operators AND and OR,
+pass it as array reference. For example:
+
+    # from t/custom_ops.t
+    my $parser = Parse::BooleanLogic->new( operators => [qw(& |)] );
+
+    # from t/custom_googlish.t
+    my $parser = Parse::BooleanLogic->new( operators => ['', 'OR'] );
+
+It's ok to have any operators and even empty.
+
+=item parens, default is ['(', ')']
+
+Pair of literal strings representing parentheses, for example it's
+possible to use curly braces:
+
+    # from t/custom_parens.t
+    my $parser = Parse::BooleanLogic->new( parens => [qw({ })] );
+
+No matter which pair is used parens must be balanced in expression.
+
+=back
+
+This constructor compiles several heavy weight regular expressions
+so it's better avoid building object right before parsing, but instead
+use global or cached one.
 
 =cut
 
 sub new {
     my $proto = shift;
-    return bless {@_}, ref($proto) || $proto;
+    my $self = bless {}, ref($proto) || $proto;
+    return $self->init( @_ );
+}
+
+=head3 init
+
+An initializer, called from the constructor. Compiles regular expressions
+and do other things with constructor's arguments. Returns this object back.
+
+=cut
+
+sub init {
+    my $self = shift;
+    my %args = @_;
+    if ( $args{'operators'} ) {
+        my @ops = map lc $_, @{ $args{'operators'} };
+        $self->{'operators'} = [ @ops ];
+        @ops = reverse @ops if length $ops[1] > length $ops[0];
+        foreach ( @ops ) {
+            unless ( length ) {
+                $_ = "(?<=\\s)";
+            }
+            else {
+                if ( /^\w/ ) {
+                    $_ = '\b'. "\Q$_\E";
+                }
+                else {
+                    $_ = "\Q$_\E";
+                }
+                if ( /\w$/ ) {
+                    $_ .= '\b';
+                }
+            }
+            $self->{'re_operator'} = qr{(?:$ops[0]|$ops[1])}i;
+        }
+    } else {
+        $self->{'operators'} = [qw(and or)];
+        $self->{'re_operator'} = qr{\b(?:AND|OR)\b}i;
+    }
+
+    if ( $args{'parens'} ) {
+        $self->{'parens'} = $args{'parens'};
+        $self->{'re_open_paren'} = qr{\Q$args{'parens'}[0]\E};
+        $self->{'re_close_paren'} = qr{\Q$args{'parens'}[1]\E};
+    } else {
+        $self->{'re_open_paren'} = qr{\(};
+        $self->{'re_close_paren'} = qr{\)};
+    }
+    $self->{'re_tokens'}  = qr{(?:$self->{'re_operator'}|$self->{'re_open_paren'}|$self->{'re_close_paren'})};
+# the next need some explanation
+# operand is something consisting of delimited strings and other strings that are not our major tokens
+# so it's a (delim string or anything until a token, ['"](start of a delim) or \Z) - this is required part
+# then you can have zero or more ocurences of above group, but with one exception - "anything" can not start with a token or ["']
+    $self->{'re_operand'} = qr{(?:$re_delim|.+?(?=$self->{re_tokens}|["']|\Z))(?:$re_delim|(?!$self->{re_tokens}|["']).+?(?=$self->{re_tokens}|["']|\Z))*};
+
+    foreach my $re (qw(re_operator re_operand re_open_paren re_close_paren)) {
+        $self->{"m$re"} = qr{\G($self->{$re})};
+    }
+
+    return $self;
 }
 
 
@@ -194,29 +294,31 @@ sub parse {
 
     while (1) {
         # State Machine
-        if ( ($want & OPERAND    ) && $string =~ /\G\s*($re_operand)/iogc ) {
-            my $m = $1;
-            $m=~ s/\s+$//;
-            $cb->{'operand'}->( $m );
-            $last = OPERAND;
-            $want = OPERATOR;
-            $want |= $depth? CLOSE_PAREN : STOP;
+        if ( $string =~ /\G\s+/gc ) {
         }
-        elsif ( ($want & OPERATOR   ) && $string =~ /\G\s*($re_operator)/iogc ) {
+        elsif ( ($want & OPERATOR   ) && $string =~ /$self->{'mre_operator'}/gc ) {
             $cb->{'operator'}->( $1 );
             $last = OPERATOR;
             $want = OPERAND | OPEN_PAREN;
         }
-        elsif ( ($want & OPEN_PAREN ) && $string =~ /\G\s*($re_open_paren)/iogc ) {
+        elsif ( ($want & OPEN_PAREN ) && $string =~ /$self->{'mre_open_paren'}/gc ) {
             $cb->{'open_paren'}->( $1 );
             $depth++;
             $last = OPEN_PAREN;
             $want = OPERAND | OPEN_PAREN;
         }
-        elsif ( ($want & CLOSE_PAREN) && $string =~ /\G\s*($re_close_paren)/iogc ) {
+        elsif ( ($want & CLOSE_PAREN) && $string =~ /$self->{'mre_close_paren'}/gc ) {
             $cb->{'close_paren'}->( $1 );
             $depth--;
             $last = CLOSE_PAREN;
+            $want = OPERATOR;
+            $want |= $depth? CLOSE_PAREN : STOP;
+        }
+        elsif ( ($want & OPERAND    ) && $string =~ /$self->{'mre_operand'}/gc ) {
+            my $m = $1;
+            $m=~ s/\s+$//;
+            $cb->{'operand'}->( $m );
+            $last = OPERAND;
             $want = OPERATOR;
             $want |= $depth? CLOSE_PAREN : STOP;
         }
@@ -343,12 +445,14 @@ See also L</fsolve>.
 sub solve {
     my ($self, $tree, $cb) = @_;
 
-    my ($res, $ea, $skip_next) = (0, 'OR', 0);
+    my ($res, $ea, $skip_next) = (0, $self->{'operators'}[1], 0);
     foreach my $entry ( @$tree ) {
         $skip_next-- and next if $skip_next > 0;
         unless ( ref $entry ) {
-            $ea = $entry;
-            $skip_next++ if ($res && $ea eq 'OR') || (!$res && $ea eq 'AND');
+            $ea = lc $entry;
+            $skip_next++ if
+                   ( $res && $ea eq $self->{'operators'}[1])
+                || (!$res && $ea eq $self->{'operators'}[0]);
             next;
         }
 
@@ -358,7 +462,7 @@ sub solve {
         } else {
             $cur = $cb->( $entry );
         }
-        if ( $ea eq 'OR' ) {
+        if ( $ea eq $self->{'operators'}[1] ) {
             $res ||= $cur;
         } else {
             $res &&= $cur;
@@ -381,12 +485,14 @@ See also L</filter> and L</solve>.
 sub fsolve {
     my ($self, $tree, $cb) = @_;
 
-    my ($res, $ea, $skip_next) = (undef, 'OR', 0);
+    my ($res, $ea, $skip_next) = (undef, $self->{'operators'}[1], 0);
     foreach my $entry ( @$tree ) {
         $skip_next-- and next if $skip_next > 0;
         unless ( ref $entry ) {
-            $ea = $entry;
-            $skip_next++ if ($res && $ea eq 'OR') || (!$res && $ea eq 'AND');
+            $ea = lc $entry;
+            $skip_next++ if
+                   ( $res && $ea eq $self->{'operators'}[1])
+                || (!$res && $ea eq $self->{'operators'}[0]);
             next;
         }
 
@@ -398,7 +504,7 @@ sub fsolve {
         }
         if ( defined $cur ) {
             $res ||= 0;
-            if ( $ea eq 'OR' ) {
+            if ( $ea eq $self->{'operators'}[1] ) {
                 $res ||= $cur;
             } else {
                 $res &&= $cur;
